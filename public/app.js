@@ -275,10 +275,11 @@
       const imagePaths =
         firstReply && Array.isArray(firstReply.image_paths) ? firstReply.image_paths : [];
       const previewImagePath = thread.thumbnail_path || (imagePaths.length > 0 ? imagePaths[0] : null);
+      if (previewImagePath) await resolveImageUrls([previewImagePath]);
       return {
         title: thread.title,
         desc: firstReply ? firstReply.content : '',
-        imageUrl: previewImagePath ? getImagePublicUrl(previewImagePath) : null,
+        imageUrl: previewImagePath ? getCachedImageUrl(previewImagePath) : null,
       };
     })().catch(() => null);
     threadPreviewCache.set(threadId, promise);
@@ -468,10 +469,32 @@
     }
   }
 
-  function getImagePublicUrl(path) {
+  const SIGNED_URL_TTL = 60 * 60 * 24;
+  const signedUrlCache = new Map();
+
+  async function resolveImageUrls(paths) {
+    const now = Date.now();
+    const need = [...new Set((paths || []).filter(Boolean))].filter((p) => {
+      const cached = signedUrlCache.get(p);
+      return !cached || cached.expiresAt <= now;
+    });
+    if (need.length === 0) return;
+    const { data, error } = await window.sb.storage.from(IMAGE_BUCKET).createSignedUrls(need, SIGNED_URL_TTL);
+    if (error || !data) return;
+    for (const item of data) {
+      if (item.signedUrl && item.path) {
+        signedUrlCache.set(item.path, {
+          url: item.signedUrl,
+          expiresAt: now + (SIGNED_URL_TTL - 60) * 1000,
+        });
+      }
+    }
+  }
+
+  function getCachedImageUrl(path) {
     if (!path) return null;
-    const { data } = window.sb.storage.from(IMAGE_BUCKET).getPublicUrl(path);
-    return data && data.publicUrl;
+    const cached = signedUrlCache.get(path);
+    return cached ? cached.url : null;
   }
 
   const lightboxEl = document.getElementById('lightbox');
@@ -523,7 +546,7 @@
       <div class="ref-preview-body">${nl2br(escapeHtml(snippet))}</div>
       ${
         hasImage
-          ? `<img class="ref-preview-thumb" src="${escapeHtml(getImagePublicUrl(reply.image_paths[0]))}" alt="" />`
+          ? `<img class="ref-preview-thumb" src="${escapeHtml(getCachedImageUrl(reply.image_paths[0]))}" alt="" />`
           : ''
       }
     `;
@@ -791,11 +814,13 @@
     }
     emptyEl.classList.add('hidden');
 
+    await resolveImageUrls(threads.map((t) => t.thumbnail_path));
+
     for (const t of threads) {
       const li = document.createElement('li');
       li.className = 'thread-item';
       const bookmarked = isBookmarked(t.id);
-      const thumbnailUrl = t.thumbnail_path ? getImagePublicUrl(t.thumbnail_path) : null;
+      const thumbnailUrl = t.thumbnail_path ? getCachedImageUrl(t.thumbnail_path) : null;
       li.innerHTML = `
         ${
           thumbnailUrl
@@ -838,7 +863,7 @@
     const canDelete = state.isAdmin || isOwn;
     const imageUrls =
       !r.is_deleted && Array.isArray(r.image_paths) && r.image_paths.length > 0
-        ? r.image_paths.map(getImagePublicUrl)
+        ? r.image_paths.map(getCachedImageUrl)
         : [];
     li.innerHTML = `
       <div class="reply-item-head">
@@ -907,6 +932,8 @@
       .select('id, thread_id, number, author_id, content, created_at, like_count, is_deleted, image_paths')
       .eq('thread_id', id)
       .order('number', { ascending: true });
+
+    await resolveImageUrls((replies || []).flatMap((r) => r.image_paths || []));
 
     const replyIds = (replies || []).map((r) => r.id);
     const [{ data: likedIdsData }, { data: myReplyIdsData }, { data: isOwnerData }] = await Promise.all([
@@ -1133,8 +1160,10 @@
       });
     }
 
-    function appendIncomingReply(r) {
+    async function appendIncomingReply(r) {
       if (!r || repliesById.has(r.id) || document.getElementById('reply-' + r.number)) return;
+      await resolveImageUrls(r.image_paths || []);
+      if (repliesById.has(r.id) || document.getElementById('reply-' + r.number)) return;
       repliesById.set(r.id, r);
       repliesByNumber.set(r.number, r);
       replyList.appendChild(buildReplyEl(r, false, false));

@@ -120,6 +120,45 @@ $$;
 create extension if not exists pg_net with schema extensions;
 create extension if not exists supabase_vault;
 
+create table if not exists gate_rate_limit (
+  id int primary key default 1,
+  last_attempt_at bigint not null default 0
+);
+insert into gate_rate_limit (id, last_attempt_at) values (1, 0) on conflict (id) do nothing;
+alter table gate_rate_limit enable row level security;
+
+create or replace function check_site_password(p_password text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, vault
+as $$
+declare
+  v_now bigint := (extract(epoch from now()) * 1000)::bigint;
+  v_last bigint;
+  v_secret text;
+begin
+  select last_attempt_at into v_last from gate_rate_limit where id = 1 for update;
+  if v_now - v_last < 1000 then
+    raise exception 'rate_limited';
+  end if;
+  update gate_rate_limit set last_attempt_at = v_now where id = 1;
+
+  select decrypted_secret into v_secret
+  from vault.decrypted_secrets
+  where name = 'site_gate_password'
+  limit 1;
+
+  if v_secret is null then
+    return false;
+  end if;
+
+  return p_password = v_secret;
+end;
+$$;
+
+grant execute on function check_site_password(text) to anon, authenticated;
+
 create or replace function delete_storage_objects(p_paths text[])
 returns void
 language plpgsql

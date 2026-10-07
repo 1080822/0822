@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://cohttpxzniquypkhalio.supabase.co wss://cohttpxzniquypkhalio.supabase.co; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'" />
 <title>パスワード | 108掲示板</title>
 <style>
   :root { --bg:#f4f5f7; --panel:#fff; --border:#dcdfe4; --text:#26282c; --accent:#3d7bfd; --danger:#e0445b; }
@@ -58,11 +58,14 @@
   <div class="box">
     <h1>108掲示板</h1>
     <p>入場にはパスワードが必要です</p>
-    <input type="password" id="password" inputmode="numeric" placeholder="パスワードを入力" autofocus />
+    <input type="password" id="password" placeholder="パスワードを入力" autofocus />
     <button id="submit">入る</button>
     <div class="error" id="error"></div>
   </div>
 
+<script src="supabase-config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="supabaseClient.js"></script>
 <script src="gateLogin.js"></script>
 </body>
 </html>

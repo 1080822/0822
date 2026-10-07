@@ -46,12 +46,15 @@
       console.error(error);
     }
     if (data && data.session) {
-      statusEl.textContent = 'ログイン中: ' + (data.session.user.email || '');
-      renderDashboard();
-    } else {
-      statusEl.textContent = '未ログイン';
-      renderLogin();
+      const { data: adminFlag } = await window.sb.rpc('is_admin');
+      if (adminFlag === true) {
+        statusEl.textContent = 'ログイン中: ' + (data.session.user.email || '');
+        renderDashboard();
+        return;
+      }
     }
+    statusEl.textContent = '未ログイン';
+    renderLogin();
   }
 
   function renderLogin() {
@@ -155,7 +158,10 @@
     const threadIds = [...new Set(reports.map((r) => r.thread_id))];
 
     const [{ data: replies }, { data: threads }] = await Promise.all([
-      window.sb.from('replies').select('*').in('id', replyIds),
+      window.sb
+        .from('replies')
+        .select('id, thread_id, number, author_id, content, created_at, like_count, is_deleted, image_paths')
+        .in('id', replyIds),
       window.sb.from('threads').select('id,title,is_deleted').in('id', threadIds),
     ]);
 

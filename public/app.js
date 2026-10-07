@@ -636,8 +636,15 @@
   async function loadMe() {
     state.identity = await window.BoardIdentity.getIdentity();
     const { data } = await window.sb.auth.getSession();
-    state.isAdmin = !!(data && data.session);
+    if (!data || !data.session) {
+      sessionStorage.removeItem('board_gate_ok_v1');
+      location.replace('gate.html');
+      return false;
+    }
+    const { data: adminFlag } = await window.sb.rpc('is_admin');
+    state.isAdmin = adminFlag === true;
     myIdEl.textContent = 'あなたのID: ' + state.identity.displayId + (state.isAdmin ? '（管理者）' : '');
+    return true;
   }
 
   async function route() {
@@ -739,8 +746,16 @@
     try {
       if (state.tab === 'bookmarks') {
         const [{ data: activeRows }, { data: archivedRows }] = await Promise.all([
-          window.sb.from('threads').select('*').eq('is_deleted', false).eq('is_archived', false),
-          window.sb.from('threads').select('*').eq('is_deleted', false).eq('is_archived', true),
+          window.sb
+            .from('threads')
+            .select('id, title, creator_id, created_at, last_reply_at, reply_count, is_archived, is_deleted, thumbnail_path')
+            .eq('is_deleted', false)
+            .eq('is_archived', false),
+          window.sb
+            .from('threads')
+            .select('id, title, creator_id, created_at, last_reply_at, reply_count, is_archived, is_deleted, thumbnail_path')
+            .eq('is_deleted', false)
+            .eq('is_archived', true),
         ]);
         const bookmarks = new Set(getBookmarks());
         threads = [...(activeRows || []), ...(archivedRows || [])]
@@ -749,7 +764,7 @@
       } else {
         const { data, error } = await window.sb
           .from('threads')
-          .select('*')
+          .select('id, title, creator_id, created_at, last_reply_at, reply_count, is_archived, is_deleted, thumbnail_path')
           .eq('is_deleted', false)
           .eq('is_archived', state.tab === 'archived')
           .order('created_at', { ascending: false });
@@ -812,7 +827,7 @@
     }
   }
 
-  function buildReplyEl(r, likedByMe) {
+  function buildReplyEl(r, likedByMe, isOwn) {
     const li = document.createElement('li');
     li.id = 'reply-' + r.number;
     li.className = 'reply-item' + (r.is_deleted ? ' deleted' : '');
@@ -820,8 +835,7 @@
     const bodyHtml = r.is_deleted
       ? escapeHtml(content)
       : nl2br(linkifyRefs(linkifyUrls(escapeHtml(content))));
-    const isOwnReply = r.author_token_hash === state.identity.tokenHash;
-    const canDelete = state.isAdmin || isOwnReply;
+    const canDelete = state.isAdmin || isOwn;
     const imageUrls =
       !r.is_deleted && Array.isArray(r.image_paths) && r.image_paths.length > 0
         ? r.image_paths.map(getImagePublicUrl)
@@ -878,7 +892,7 @@
 
     const { data: thread, error: threadErr } = await window.sb
       .from('threads')
-      .select('*')
+      .select('id, title, creator_id, created_at, last_reply_at, reply_count, is_archived, is_deleted, thumbnail_path')
       .eq('id', id)
       .eq('is_deleted', false)
       .single();
@@ -890,23 +904,25 @@
 
     const { data: replies } = await window.sb
       .from('replies')
-      .select('*')
+      .select('id, thread_id, number, author_id, content, created_at, like_count, is_deleted, image_paths')
       .eq('thread_id', id)
       .order('number', { ascending: true });
 
     const replyIds = (replies || []).map((r) => r.id);
-    let likedIds = [];
-    if (replyIds.length > 0) {
-      const { data: likeRows } = await window.sb
-        .from('likes')
-        .select('reply_id')
-        .eq('user_token_hash', state.identity.tokenHash)
-        .in('reply_id', replyIds);
-      likedIds = (likeRows || []).map((r) => r.reply_id);
-    }
+    const [{ data: likedIdsData }, { data: myReplyIdsData }, { data: isOwnerData }] = await Promise.all([
+      replyIds.length > 0
+        ? window.sb.rpc('my_liked_reply_ids', { p_reply_ids: replyIds, p_token_hash: state.identity.tokenHash })
+        : Promise.resolve({ data: [] }),
+      replyIds.length > 0
+        ? window.sb.rpc('my_reply_ids', { p_thread_id: id, p_token_hash: state.identity.tokenHash })
+        : Promise.resolve({ data: [] }),
+      window.sb.rpc('is_my_thread', { p_thread_id: id, p_token_hash: state.identity.tokenHash }),
+    ]);
+    const likedIds = likedIdsData || [];
+    const myReplyIds = new Set(myReplyIdsData || []);
 
     document.getElementById('thread-title').textContent = thread.title;
-    const isOwner = thread.creator_token_hash === state.identity.tokenHash;
+    const isOwner = isOwnerData === true;
     const canDeleteThread = isOwner || state.isAdmin;
     document.getElementById('thread-meta').innerHTML = `
       レス数 <span id="reply-count-num">${thread.reply_count}</span>　<span id="thread-archived-badge" class="archived-badge${
@@ -974,7 +990,8 @@
     replyList.innerHTML = '';
     for (const r of replies || []) {
       const likedByMe = likedIds.includes(r.id);
-      replyList.appendChild(buildReplyEl(r, likedByMe));
+      const isOwn = myReplyIds.has(r.id);
+      replyList.appendChild(buildReplyEl(r, likedByMe, isOwn));
     }
     for (const number of backrefsByNumber.keys()) updateBackrefsEl(number);
 
@@ -1120,7 +1137,7 @@
       if (!r || repliesById.has(r.id) || document.getElementById('reply-' + r.number)) return;
       repliesById.set(r.id, r);
       repliesByNumber.set(r.number, r);
-      replyList.appendChild(buildReplyEl(r, false));
+      replyList.appendChild(buildReplyEl(r, false, false));
       if (!r.is_deleted) {
         for (const t of extractBackrefTargets(r.content)) {
           addBackref(t, r.number);
@@ -1139,12 +1156,8 @@
     }
 
     activeReplyChannel = window.sb
-      .channel('replies-thread-' + id)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'replies', filter: `thread_id=eq.${id}` },
-        (payload) => appendIncomingReply(payload.new)
-      )
+      .channel('replies-thread-' + id, { config: { private: true } })
+      .on('broadcast', { event: 'new_reply' }, (payload) => appendIncomingReply(payload.payload))
       .subscribe();
   }
 
@@ -1237,7 +1250,7 @@
     if (searchMode === 'thread') {
       const { data, error } = await window.sb
         .from('threads')
-        .select('*')
+        .select('id, title, created_at, last_reply_at, reply_count, is_archived, is_deleted, thumbnail_path')
         .eq('is_deleted', false)
         .ilike('title', `%${q}%`)
         .order('last_reply_at', { ascending: false })
@@ -1265,7 +1278,7 @@
     } else {
       const { data, error } = await window.sb
         .from('replies')
-        .select('*, threads(title, is_deleted)')
+        .select('id, thread_id, number, content, created_at, is_deleted, threads(title, is_deleted)')
         .eq('is_deleted', false)
         .ilike('content', `%${q}%`)
         .order('created_at', { ascending: false })
@@ -1323,5 +1336,7 @@
   });
 
   window.addEventListener('hashchange', route);
-  loadMe().then(route);
+  loadMe().then((ok) => {
+    if (ok) route();
+  });
 })();

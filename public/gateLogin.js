@@ -16,10 +16,9 @@
 
     const { data, error } = await window.sb.rpc('check_site_password', { p_password: password });
 
-    btn.disabled = false;
-    btn.textContent = originalText;
-
     if (error) {
+      btn.disabled = false;
+      btn.textContent = originalText;
       errorEl.textContent =
         error.message === 'rate_limited'
           ? '少し間隔をあけてからもう一度お試しください。'
@@ -27,14 +26,30 @@
       return;
     }
 
-    if (data === true) {
-      sessionStorage.setItem(GATE_KEY, '1');
-      location.href = 'index.html';
-    } else {
+    if (!data || !data.ok) {
+      btn.disabled = false;
+      btn.textContent = originalText;
       errorEl.textContent = 'パスワードが違います。';
       input.value = '';
       input.focus();
+      return;
     }
+
+    const { error: signInError } = await window.sb.auth.signInWithPassword({
+      email: data.viewer_email,
+      password: data.viewer_password,
+    });
+
+    btn.disabled = false;
+    btn.textContent = originalText;
+
+    if (signInError) {
+      errorEl.textContent = '通信エラーが発生しました。もう一度お試しください。';
+      return;
+    }
+
+    sessionStorage.setItem(GATE_KEY, '1');
+    location.href = 'index.html';
   }
 
   btn.addEventListener('click', submit);

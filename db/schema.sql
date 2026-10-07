@@ -64,6 +64,20 @@ create table if not exists bans (
   active boolean not null default true
 );
 
+create table if not exists admins (
+  user_id uuid primary key references auth.users(id) on delete cascade
+);
+alter table admins enable row level security;
+
+create or replace function is_admin()
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists(select 1 from admins where user_id = auth.uid());
+$$;
+
 create index if not exists idx_threads_sort on threads(is_archived, is_deleted, last_reply_at desc);
 create index if not exists idx_replies_thread on replies(thread_id, number);
 create index if not exists idx_reports_status on reports(status);
@@ -79,19 +93,19 @@ alter table reports enable row level security;
 alter table bans enable row level security;
 
 drop policy if exists threads_select on threads;
-create policy threads_select on threads for select using (true);
+create policy threads_select on threads for select using (auth.role() = 'authenticated');
 
 drop policy if exists replies_select on replies;
-create policy replies_select on replies for select using (true);
+create policy replies_select on replies for select using (auth.role() = 'authenticated');
 
 drop policy if exists likes_select on likes;
-create policy likes_select on likes for select using (true);
+create policy likes_select on likes for select using (auth.role() = 'authenticated');
 
 drop policy if exists reports_select on reports;
-create policy reports_select on reports for select using (auth.role() = 'authenticated');
+create policy reports_select on reports for select using (is_admin());
 
 drop policy if exists bans_select on bans;
-create policy bans_select on bans for select using (auth.role() = 'authenticated');
+create policy bans_select on bans for select using (is_admin());
 
 create or replace function is_banned(p_token_hash text)
 returns boolean
@@ -111,7 +125,7 @@ security definer
 set search_path = public
 as $$
 begin
-  if auth.role() <> 'authenticated' then
+  if not is_admin() then
     raise exception 'admin_only';
   end if;
 end;
@@ -127,8 +141,9 @@ create table if not exists gate_rate_limit (
 insert into gate_rate_limit (id, last_attempt_at) values (1, 0) on conflict (id) do nothing;
 alter table gate_rate_limit enable row level security;
 
+drop function if exists check_site_password(text);
 create or replace function check_site_password(p_password text)
-returns boolean
+returns json
 language plpgsql
 security definer
 set search_path = public, vault
@@ -137,6 +152,8 @@ declare
   v_now bigint := (extract(epoch from now()) * 1000)::bigint;
   v_last bigint;
   v_secret text;
+  v_viewer_email text;
+  v_viewer_password text;
 begin
   select last_attempt_at into v_last from gate_rate_limit where id = 1 for update;
   if v_now - v_last < 1000 then
@@ -149,11 +166,21 @@ begin
   where name = 'site_gate_password'
   limit 1;
 
-  if v_secret is null then
-    return false;
+  if v_secret is null or p_password <> v_secret then
+    return json_build_object('ok', false);
   end if;
 
-  return p_password = v_secret;
+  select decrypted_secret into v_viewer_email
+  from vault.decrypted_secrets
+  where name = 'viewer_account_email'
+  limit 1;
+
+  select decrypted_secret into v_viewer_password
+  from vault.decrypted_secrets
+  where name = 'viewer_account_password'
+  limit 1;
+
+  return json_build_object('ok', true, 'viewer_email', v_viewer_email, 'viewer_password', v_viewer_password);
 end;
 $$;
 
@@ -319,6 +346,35 @@ begin
 end;
 $$;
 
+create or replace function is_my_thread(p_thread_id bigint, p_token_hash text)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists(
+    select 1 from threads where id = p_thread_id and creator_token_hash = p_token_hash
+  );
+$$;
+
+create or replace function my_reply_ids(p_thread_id bigint, p_token_hash text)
+returns setof bigint
+language sql
+security definer
+set search_path = public
+as $$
+  select id from replies where thread_id = p_thread_id and author_token_hash = p_token_hash;
+$$;
+
+create or replace function my_liked_reply_ids(p_reply_ids bigint[], p_token_hash text)
+returns setof bigint
+language sql
+security definer
+set search_path = public
+as $$
+  select reply_id from likes where reply_id = any(p_reply_ids) and user_token_hash = p_token_hash;
+$$;
+
 create or replace function create_report(
   p_reply_id bigint,
   p_reason text,
@@ -360,7 +416,7 @@ set search_path = public
 as $$
 declare
   v_thread threads%rowtype;
-  v_is_admin boolean := auth.role() = 'authenticated';
+  v_is_admin boolean := is_admin();
   v_all_paths text[];
 begin
   select * into v_thread from threads where id = p_thread_id;
@@ -396,7 +452,7 @@ set search_path = public
 as $$
 declare
   v_reply replies%rowtype;
-  v_is_admin boolean := auth.role() = 'authenticated';
+  v_is_admin boolean := is_admin();
 begin
   select * into v_reply from replies where id = p_reply_id;
   if not found then
@@ -464,20 +520,43 @@ begin
 end;
 $$;
 
-grant execute on function is_banned(text) to anon, authenticated;
-grant execute on function create_thread(text, text, text, text, text[], text) to anon, authenticated;
-grant execute on function add_reply(bigint, text, text, text, text[]) to anon, authenticated;
-grant execute on function toggle_like(bigint, text) to anon, authenticated;
-grant execute on function create_report(bigint, text, text) to anon, authenticated;
-grant execute on function delete_thread(bigint, text) to anon, authenticated;
-grant execute on function delete_reply(bigint, text) to anon, authenticated;
+revoke execute on function is_banned(text) from anon, authenticated;
+grant execute on function is_banned(text) to authenticated;
+revoke execute on function create_thread(text, text, text, text, text[], text) from anon, authenticated;
+grant execute on function create_thread(text, text, text, text, text[], text) to authenticated;
+revoke execute on function add_reply(bigint, text, text, text, text[]) from anon, authenticated;
+grant execute on function add_reply(bigint, text, text, text, text[]) to authenticated;
+revoke execute on function toggle_like(bigint, text) from anon, authenticated;
+grant execute on function toggle_like(bigint, text) to authenticated;
+revoke execute on function create_report(bigint, text, text) from anon, authenticated;
+grant execute on function create_report(bigint, text, text) to authenticated;
+revoke execute on function delete_thread(bigint, text) from anon, authenticated;
+grant execute on function delete_thread(bigint, text) to authenticated;
+revoke execute on function delete_reply(bigint, text) from anon, authenticated;
+grant execute on function delete_reply(bigint, text) to authenticated;
 grant execute on function admin_delete_reply(bigint) to authenticated;
 grant execute on function admin_resolve_report(bigint) to authenticated;
 grant execute on function admin_ban_by_reply(bigint, text) to authenticated;
 grant execute on function admin_ban_token(text, text) to authenticated;
 grant execute on function admin_unban(bigint) to authenticated;
+revoke execute on function is_my_thread(bigint, text) from anon, authenticated;
+grant execute on function is_my_thread(bigint, text) to authenticated;
+revoke execute on function my_reply_ids(bigint, text) from anon, authenticated;
+grant execute on function my_reply_ids(bigint, text) to authenticated;
+revoke execute on function my_liked_reply_ids(bigint[], text) from anon, authenticated;
+grant execute on function my_liked_reply_ids(bigint[], text) to authenticated;
+grant execute on function is_admin() to authenticated;
 
-grant select on threads, replies, likes to anon, authenticated;
+revoke select on threads from anon, authenticated;
+grant select (id, title, creator_id, created_at, last_reply_at, reply_count, is_archived, is_deleted, thumbnail_path)
+  on threads to authenticated;
+
+revoke select on replies from anon, authenticated;
+grant select (id, thread_id, number, author_id, content, created_at, like_count, is_deleted, image_paths)
+  on replies to authenticated;
+
+revoke select on likes from anon, authenticated;
+
 grant select on reports, bans to authenticated;
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
@@ -491,13 +570,17 @@ on conflict (id) do update set
   allowed_mime_types = excluded.allowed_mime_types;
 
 drop policy if exists "post-images public read" on storage.objects;
-create policy "post-images public read"
+drop policy if exists "post-images authenticated read" on storage.objects;
+create policy "post-images authenticated read"
   on storage.objects for select
+  to authenticated
   using (bucket_id = 'post-images');
 
 drop policy if exists "post-images anyone can upload" on storage.objects;
-create policy "post-images anyone can upload"
+drop policy if exists "post-images authenticated can upload" on storage.objects;
+create policy "post-images authenticated can upload"
   on storage.objects for insert
+  to authenticated
   with check (bucket_id = 'post-images');
 
 drop policy if exists "post-images admin can delete" on storage.objects;
@@ -505,16 +588,49 @@ drop policy if exists "post-images anyone can delete" on storage.objects;
 
 do $$
 begin
-  if not exists (
+  if exists (
     select 1 from pg_publication_tables
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'replies'
   ) then
-    alter publication supabase_realtime add table replies;
+    alter publication supabase_realtime drop table replies;
   end if;
-  if not exists (
+  if exists (
     select 1 from pg_publication_tables
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'threads'
   ) then
-    alter publication supabase_realtime add table threads;
+    alter publication supabase_realtime drop table threads;
   end if;
 end $$;
+
+create or replace function broadcast_new_reply()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+begin
+  perform realtime.send(
+    jsonb_build_object(
+      'id', new.id,
+      'thread_id', new.thread_id,
+      'number', new.number,
+      'author_id', new.author_id,
+      'content', new.content,
+      'created_at', new.created_at,
+      'like_count', new.like_count,
+      'is_deleted', new.is_deleted,
+      'image_paths', new.image_paths
+    ),
+    'new_reply',
+    'replies-thread-' || new.thread_id,
+    true
+  );
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_broadcast_new_reply on replies;
+create trigger trg_broadcast_new_reply
+after insert on replies
+for each row
+execute function broadcast_new_reply();
